@@ -1,10 +1,10 @@
 import os
 import random
 
-from game import game, Team, all_rules, all_powerups
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application, CommandHandler, CallbackQueryHandler
+
+from game import game, Team, all_rules, all_powerups
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -34,9 +34,11 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/delete_team <team_number> - Deletes the specified team chat assignment\n"
             "/delete_admin_chat - Deletes the admin chat assignment"
             "/delete_location_chat - Deletes the location chat assignment\n"
-            "/catch - Marks a catch as having occurred in the game, updates teams' roles amd starts timer\n"
+            "/catch - Marks a catch as having occurred in the game and updates teams' roles. Once all teams are ready, restart the game by running /restart_game\n"
             "/start_game - Starts the game for all teams\n"
-            "/restart_game - Restarts the game for all teams\n"
+            "/restart_game - Restarts the game for all teams after a catch\n"
+            "/end_game - Ends the game for all teams, can be undone by calling /start_game\n"
+            "/reset_game - Resets the game state entirely, cannot be undone\n"
         )
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=help_text)
@@ -64,7 +66,7 @@ async def create_team_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         game.teams[team_number] = team
         game.chat_id_to_team[update.effective_chat.id] = team
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Team {team_number + 1} created!")
-    except Exception as e:
+    except Exception:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Team number should be between 1 and 3!")
         return
 
@@ -77,15 +79,27 @@ async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def current_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("current_task_handler called")
 
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
+
     team = game.chat_id_to_team[update.effective_chat.id]
     if not team.is_running:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="You are not currently running!")
+        return
+
+    if team.current_task.image is None:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="You do not currently have a task!")
         return
 
     await context.bot.send_photo(chat_id=update.effective_chat.id, photo=team.current_task.image)
 
 async def show_powerups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("show_powerups_handler called")
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
 
     team = game.chat_id_to_team[update.effective_chat.id]
     if not team.is_running:
@@ -102,6 +116,10 @@ async def show_powerups_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def use_powerup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("use_powerup_handler called")
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
 
     team = game.chat_id_to_team[update.effective_chat.id]
     if not team.is_running:
@@ -126,6 +144,10 @@ async def use_powerup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def use_powerup_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("use_powerup_callback_handler called")
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
 
     await update.effective_message.edit_reply_markup(reply_markup=None)
 
@@ -158,36 +180,16 @@ async def use_powerup_callback_handler(update: Update, context: ContextTypes.DEF
                 await context.bot.send_message(chat_id=team.chat_id, text="Runners have used a powerup!")
                 await context.bot.send_photo(chat_id=team.chat_id, photo=powerup.image)
 
-async def complete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("complete_task_handler called")
-
-    team = game.chat_id_to_team[update.effective_chat.id]
-    if not team.is_running:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="You are not currently running!")
-        return
-
-    if team.current_task.type == "normal":
-        team.score += 2
-    elif team.current_task.type == "extreme":
-        team.score += 3
-
-    if len(team.tasks) == 0:
-        return
-
-    for temp_team in game.teams:
-        if temp_team.is_running:
-            await context.bot.send_message(chat_id=temp_team.chat_id, text=f"Good job! Your current score is {temp_team.score}")
-        else:
-            await context.bot.send_message(chat_id=temp_team.chat_id, text=f"The runners have completed a task!")
-
-    await _start_draw(team, context)
-
-async def _start_draw(team: Team, context: ContextTypes.DEFAULT_TYPE):
+async def _start_draw(team: Team, update: Update, context: ContextTypes.DEFAULT_TYPE, *, num_cards: int = 3, reveal_more: bool = True):
     print("_start_draw called")
 
+    if not reveal_more:
+        await _draw_tasks(team, update, context, delete_message=False)
+        return
+
     random.shuffle(team.tasks)
-    team.temp_tasks = team.tasks[:3]
-    team.tasks = team.tasks[3:]
+    team.temp_tasks = team.tasks[:num_cards]
+    team.tasks = team.tasks[num_cards:]
 
     keyboard = [
         [InlineKeyboardButton("Reveal 3 more tasks", callback_data=f"draw:tasks:{game.cycle_num}")],
@@ -203,10 +205,89 @@ async def _start_draw(team: Team, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def _draw_tasks(team: Team, update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _complete_task_helper(update: Update, context: ContextTypes.DEFAULT_TYPE, *, num_cards: int = 3, reveal_more: bool = True):
+    team = game.chat_id_to_team[update.effective_chat.id]
+
+    if team.current_task.type == "normal":
+        team.score += 2
+    elif team.current_task.type == "extreme":
+        team.score += 3
+
+    if len(team.tasks) == 0:
+        return
+
+    for temp_team in game.teams:
+        if temp_team.is_running:
+            await context.bot.send_message(chat_id=temp_team.chat_id, text=f"Good job! Your current score is {temp_team.score}")
+        else:
+            await context.bot.send_message(chat_id=temp_team.chat_id, text=f"The runners have completed a task!")
+
+    team.current_task = None
+
+    await _start_draw(team, update, context, num_cards=num_cards, reveal_more=reveal_more)
+
+async def complete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("complete_task_handler called")
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
+
+    team = game.chat_id_to_team[update.effective_chat.id]
+    if not team.is_running:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="You are not currently running!")
+        return
+
+    if team.current_task.image is None:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="You do not currently have a task!")
+        return
+
+    if team.current_task.id == 35:  # Fullerton Hotel
+        keyboard = [[
+            InlineKeyboardButton("Early", callback_data="fullerton:early"),
+            InlineKeyboardButton("Late", callback_data="fullerton:late")
+        ]]
+        await context.bot.send_message(chat_id=team.chat_id, text="Were you early or late to your chosen location?", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    elif team.current_task.id == 39:  # Marina Bay Sands
+        await _complete_task_helper(update, context, num_cards=random.randint(1, 3))
+        return
+
+    await _complete_task_helper(update, context)
+
+async def _fullerton_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("_fullerton_handler called")
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
+
+    team = game.chat_id_to_team[update.effective_chat.id]
+    if not team.is_running:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="You are not currently running!")
+        return
+
+    if team.current_task.image is None:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="You do not currently have a task!")
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.split(":")[1] == "early":
+        await _complete_task_helper(team, context)
+    elif query.data.split(":")[1] == "late":
+        await _complete_task_helper(team, context, reveal_more=False)
+
+async def _draw_tasks(team: Team, update: Update, context: ContextTypes.DEFAULT_TYPE, *, delete_message: bool = True):
     print("_draw_tasks called")
 
-    await update.effective_message.delete()
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
+
+    if delete_message:
+        await update.effective_message.delete()
 
     new_tasks = team.tasks[:3]
     team.temp_tasks += team.tasks[:3]
@@ -216,7 +297,6 @@ async def _draw_tasks(team: Team, update: Update, context: ContextTypes.DEFAULT_
     for task_num, task in enumerate(team.temp_tasks):
         keyboard.append([InlineKeyboardButton(f"Task {task_num + 1}", callback_data=f"draw_tasks_1:{task_num}:{game.cycle_num}")])
 
-    # await context.bot.send_message(chat_id=update.effective_chat.id, text="You have drawn these 6 tasks:")
     for task in new_tasks:
         await context.bot.send_photo(chat_id=update.effective_chat.id, photo=task.image)
     await context.bot.send_message(
@@ -227,6 +307,10 @@ async def _draw_tasks(team: Team, update: Update, context: ContextTypes.DEFAULT_
 
 async def _draw_tasks_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.edit_reply_markup(reply_markup=None)
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
 
     print("_draw_tasks_1 called")
 
@@ -273,6 +357,10 @@ async def _draw_powerups_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print("_draw_powerups_1 called")
 
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
+
     team = game.chat_id_to_team[update.effective_chat.id]
 
     query = update.callback_query
@@ -305,6 +393,10 @@ async def _draw_powerups_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print("_draw_powerups_2 called")
 
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
+
     team = game.chat_id_to_team[update.effective_chat.id]
 
     query = update.callback_query
@@ -327,6 +419,10 @@ async def _draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.edit_reply_markup(reply_markup=None)
 
     print("_draw called")
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has not started yet!")
+        return
 
     team = game.chat_id_to_team[update.effective_chat.id]
 
@@ -436,6 +532,7 @@ async def catch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assert running_team_num is not None
 
     game.cycle_num += 1
+    game.is_started = False
 
     for team_num, team in enumerate(game.teams):
         if team_num == running_team_num:
@@ -451,8 +548,10 @@ async def catch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id=game.location_chat_id, text="Please turn off all live locations now!")
 
-async def _start_game(context: ContextTypes.DEFAULT_TYPE):
+async def _start_game(context: ContextTypes.DEFAULT_TYPE, update: Update):
     print("_start_game called")
+
+    game.is_started = True
 
     for team in game.teams:
         if team.is_running:
@@ -460,7 +559,7 @@ async def _start_game(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=team.chat_id,
                 text="The game has started! You are the runners, please send your location into the location chat."
                 )
-            await _start_draw(team, context)
+            await _start_draw(team, update, context)
         else:
             await context.bot.send_message(
                 chat_id=team.chat_id,
@@ -494,7 +593,7 @@ async def start_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     game.is_started = True
     game.cycle_num = 1
 
-    await _start_game(context)
+    await _start_game(context, update)
 
 async def restart_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("restart_game_handler called")
@@ -503,7 +602,43 @@ async def restart_game_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Only the admin chat can restart games!")
         return
 
-    await _start_game(context)
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game is not currently running!")
+        return
+
+    await _start_game(context, update)
+
+async def end_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("end_game_handler called")
+
+    if update.effective_chat.id != game.admin_chat_id:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Only the admin chat can end games!")
+        return
+
+    if not game.is_started:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="The game is not currently running!")
+        return
+
+    game.is_started = False
+
+    for team in game.teams:
+        await context.bot.send_message(chat_id=team.chat_id, text="The game has ended!")
+
+async def reset_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("reset_game_handler called")
+
+    if update.effective_chat.id != game.admin_chat_id:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Only the admin chat can reset the game!")
+        return
+
+    game.admin_chat_id = None
+    game.location_chat_id = None
+    game.teams = [None, None, None]
+    game.chat_id_to_team = dict()
+    game.is_started = False
+    game.cycle_num = 1
+
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="The game has been reset, you must allocate the bot to new chats!")
 
 def set_handlers(application: Application):
     application.add_handler(CommandHandler("start", start_handler))
@@ -517,6 +652,7 @@ def set_handlers(application: Application):
     application.add_handler(CallbackQueryHandler(use_powerup_callback_handler, pattern=r"^use_powerup:"))
 
     application.add_handler(CommandHandler("complete_task", complete_task_handler))
+    application.add_handler(CallbackQueryHandler(_fullerton_handler, pattern=r"^fullerton:"))
     application.add_handler(CallbackQueryHandler(_draw, pattern=r"^draw:"))
     application.add_handler(CallbackQueryHandler(_draw_tasks_1, pattern=r"^draw_tasks_1:"))
     application.add_handler(CallbackQueryHandler(_draw_powerups_1, pattern=r"^draw_powerups_1:"))
@@ -531,4 +667,6 @@ def set_handlers(application: Application):
     application.add_handler(CommandHandler("catch", catch_handler))
     application.add_handler(CommandHandler("start_game", start_game_handler))
     application.add_handler(CommandHandler("restart_game", restart_game_handler))
+    application.add_handler(CommandHandler("end_game", end_game_handler))
+    application.add_handler(CommandHandler("reset_game", reset_game_handler))
 

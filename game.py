@@ -6,15 +6,18 @@ from typing import Literal
 class Task:
     type: Literal["normal", "extreme"]
     image: Path
+    id: int
 
 @dataclass
 class Powerup:
     image: Path
     send_to_chasers: bool
+    id: int
 
 @dataclass
 class Rule:
     image: Path
+    id: int
 
 @dataclass
 class Team:
@@ -41,29 +44,26 @@ all_tasks: list[Task] = []
 all_powerups: list[Powerup] = []
 all_rules: list[Rule] = []
 
+_POWERUP_SEND_TO_CHASER_IDS = [1, 2, 3, 4, 5, 8, 9]
+
 for card_path in Path("cards").iterdir():
     if not card_path.is_file():
         continue
 
     card_info = card_path.name.split(" ")
-    card_type = card_info[0].lower()
-    if card_type == "normal":
-        all_tasks.append(Task(type="normal", image=card_path))
-    elif card_type == "extreme":
-        all_tasks.append(Task(type="extreme", image=card_path))
-    elif card_type == "powerup":
-        card_info_1 = card_info[1].lower()
-        if card_info_1 == "true":
-            send_to_chasers = True
-        elif card_info_1 == "false":
-            send_to_chasers = False
-        else:
-            print(f"Powerup {card_path} has an invalid name!")
-            continue
 
-        all_powerups.append(Powerup(image=card_path, send_to_chasers=send_to_chasers))
-    elif card_type == "rule":
-        all_rules.append(Rule(image=card_path))
+    if card_info[0] == "Location":
+        if card_info[1] == "N":
+            all_tasks.append(Task(type="normal", image=card_path, id=int(card_info[2])))
+        elif card_info[1] == "E":
+            all_tasks.append(Task(type="extreme", image=card_path, id=int(card_info[2])))
+    elif card_info[0] == "Powerup":
+        powerup_id = int(card_info[1])
+        all_powerups.append(Powerup(image=card_path, send_to_chasers=powerup_id in _POWERUP_SEND_TO_CHASER_IDS, id=powerup_id))
+    elif card_info[0] == "Info":
+        all_rules.append(Rule(image=card_path, id=int(card_info[1])))
+
+    all_rules.sort(key=lambda x: x.id)
 
 game = Game()
 
