@@ -121,7 +121,7 @@ def is_team_chat(chat_id: int) -> bool:
     return chat_id_to_team(chat_id) is not None
 
 def is_admin_chat(chat_id: int) -> bool:
-    return admin_chat_id_to_game(chat_id) is not None
+    return chat_id_to_game(chat_id) is not None
 
 def is_location_chat(chat_id: int) -> bool:
     return any([game.location_chat is not None and chat_id == game.location_chat.chat_id for game in games.values()])

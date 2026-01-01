@@ -4,8 +4,7 @@ from enum import StrEnum, auto
 from typing import override
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, Application, CommandHandler, ConversationHandler, CallbackQueryHandler, \
-    CallbackContext
+from telegram.ext import ContextTypes, Application, CommandHandler, ConversationHandler, CallbackQueryHandler
 
 from checks import guard, chat_not_assigned_check, valid_game_id_check, is_admin_chat_check, \
     team_chat_is_assigned_check, \
