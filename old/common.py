@@ -66,7 +66,7 @@ all_tasks = []
 all_powerups = []
 all_rules = []
 
-for card_path in Path("cards").iterdir():
+for card_path in Path("../cards").iterdir():
     if not card_path.is_file():
         continue
 

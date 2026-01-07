@@ -208,9 +208,9 @@ async def _start_draw(team: Team, update: Update, context: ContextTypes.DEFAULT_
 async def _complete_task_helper(update: Update, context: ContextTypes.DEFAULT_TYPE, *, num_cards: int = 3, reveal_more: bool = True):
     team = game.chat_id_to_team[update.effective_chat.id]
 
-    if team.current_task.type == "normal":
+    if team.current_task.card_type == "normal":
         team.score += 2
-    elif team.current_task.type == "extreme":
+    elif team.current_task.card_type == "extreme":
         team.score += 3
 
     if len(team.tasks) == 0:
@@ -242,14 +242,14 @@ async def complete_task_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(chat_id=update.effective_chat.id, text="You do not currently have a task!")
         return
 
-    if team.current_task.id == 35:  # Fullerton Hotel
+    if team.current_task.card_id == 35:  # Fullerton Hotel
         keyboard = [[
             InlineKeyboardButton("Early", callback_data="fullerton:early"),
             InlineKeyboardButton("Late", callback_data="fullerton:late")
         ]]
         await context.bot.send_message(chat_id=team.chat_id, text="Were you early or late to your chosen location?", reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    elif team.current_task.id == 39:  # Marina Bay Sands
+    elif team.current_task.card_id == 39:  # Marina Bay Sands
         await _complete_task_helper(update, context, num_cards=random.randint(1, 3))
         return
 

@@ -46,7 +46,7 @@ all_rules: list[Rule] = []
 
 _POWERUP_SEND_TO_CHASER_IDS = [1, 2, 3, 4, 5, 8, 9]
 
-for card_path in Path("cards").iterdir():
+for card_path in Path("../cards").iterdir():
     if not card_path.is_file():
         continue
 
@@ -63,7 +63,7 @@ for card_path in Path("cards").iterdir():
     elif card_info[0] == "Info":
         all_rules.append(Rule(image=card_path, id=int(card_info[1])))
 
-    all_rules.sort(key=lambda x: x.id)
+    all_rules.sort(key=lambda x: x.card_id)
 
 game = Game()
 

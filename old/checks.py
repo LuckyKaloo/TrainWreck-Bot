@@ -10,11 +10,9 @@ from telegram.ext import ContextTypes
 from common import games, chat_id_to_team, is_admin_chat, is_location_chat, \
     chat_id_to_chat, chat_id_to_game
 
-OutT = TypeVar("OutT")
-P = ParamSpec("P")
-HandlerType = Callable[Concatenate[Update, ContextTypes.DEFAULT_TYPE, P], Coroutine[Any, Any, OutT | None]]
-def guard[T](*checks: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[bool]]) -> Callable[[HandlerType], HandlerType]:
-    def decorator(func: HandlerType) -> HandlerType:
+type HandlerType[OutT] = Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, OutT | None]]
+def guard[T](*checks: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[bool]]) -> Callable[[HandlerType[T]], HandlerType[T]]:
+    def decorator(func: HandlerType[T]) -> HandlerType[T]:
         @wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
             for check in checks:

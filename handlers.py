@@ -1,23 +1,40 @@
-# --- Basic handlers ---
+from enum import Enum, auto
 import random
-from enum import StrEnum, auto
-from typing import override
+from typing import Any, Literal, cast
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, Application, CommandHandler, ConversationHandler, CallbackQueryHandler
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from telegram import InlineKeyboardButton, Update, InlineKeyboardMarkup, CallbackQuery
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, CommandHandler, ConversationHandler
 
-from checks import guard, chat_not_assigned_check, valid_game_id_check, is_admin_chat_check, \
-    team_chat_is_assigned_check, \
-    location_chat_is_assigned_check, no_callback_check, is_runner_check, chats_all_assigned_check, \
-    game_not_started_check, game_not_paused_check, game_is_started_check, game_is_paused_check
-from common import games, Team, Game, Chat, chat_id_to_chat, chat_id_to_team, Task, Powerup, chat_id_to_game, \
-    all_powerups
+from db import engine
+from mappings import ChatRole, Game, GameChat, Card, CardType, TeamCardJoin, CardState, TaskCard, TaskSpecial, \
+    PowerupCard
+from utils import CheckFailedError, select_card_keyboard_markup, enum_callback_pattern, get_chat, \
+    get_chat_id, get_game, \
+    get_running_team_chat, \
+    graceful_fail, \
+    admin_get_game, show_tasks, \
+    to_started_game, no_callback_graceful_fail, show_powerups, select_card, add_points
 
 
+# --- General handlers ---
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, text="Welcome to TrainWreck! Type /help for a list of commands.",
+    _ = await context.bot.send_message(
+        get_chat_id(update), "Welcome to TrainWreck! Type /help for a list of commands.",
     )
+
+
+async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with Session(engine) as session:
+        rule_cards = session.scalars(
+            select(Card).where(Card.card_type == CardType.RULE),
+        ).all()
+
+        for rule_card in rule_cards:
+            _ = await context.bot.send_photo(
+                get_chat_id(update), rule_card.image_path,
+            )
 
 
 # TODO
@@ -35,424 +52,363 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/location_chat - Sets this chat as the location chat\n"
     )
 
-    if update.effective_chat.id == games[0].admin_chat.chat_id:
-        help_text += (
-            "\nAdmin commands:\n"
-            "/delete_team <team_number> - Deletes the specified team chat assignment\n"
-            "/delete_admin_chat - Deletes the admin chat assignment"
-            "/delete_location_chat - Deletes the location chat assignment\n"
-            "/catch - Marks a catch as having occurred in the game and updates teams' roles. Once all teams are ready, restart the game by running /restart_game\n"
-            "/start_game - Starts the game for all teams\n"
-            "/restart_game - Restarts the game for all teams after a catch\n"
-            "/end_game - Ends the game for all teams, can be undone by calling /start_game\n"
-            "/reset_game - Resets the game state entirely, cannot be undone\n"
+    with Session(engine) as session:
+        try:
+            chat = get_chat(session, update)
+            if chat.game.admin_chat.chat_id == chat.chat_id:
+                help_text += (
+                    "\nAdmin commands:\n"
+                    "/delete_team <team_number> - Deletes the specified team chat assignment\n"
+                    "/delete_admin_chat - Deletes the admin chat assignment"
+                    "/delete_location_chat - Deletes the location chat assignment\n"
+                    "/catch - Marks a catch as having occurred in the game and updates teams' roles. Once all teams are ready, restart the game by running /restart_game\n"
+                    "/start_game - Starts the game for all teams\n"
+                    "/restart_game - Restarts the game for all teams after a catch\n"
+                    "/end_game - Ends the game for all teams, can be undone by calling /start_game\n"
+                    "/reset_game - Resets the game state entirely, cannot be undone\n"
+                )
+        except CheckFailedError:
+            pass
+
+        _ = await context.bot.send_message(chat_id=get_chat_id(update), text=help_text)
+
+
+@graceful_fail
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    with Session(engine) as session:
+        chat = get_chat(session, update)
+        chat_id = chat.chat_id
+
+        if chat.callback_message_id is None:
+            _ = await context.bot.send_message(
+                chat_id, "No operation to cancel",
+            )
+            return ConversationHandler.END
+
+        _ = await context.bot.edit_message_reply_markup(
+            chat_id, chat.callback_message_id, reply_markup=None,
         )
+        _ = await context.bot.send_message(
+            chat_id, "Operation cancelled",
+        )
+        chat.callback_message_id = None
 
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=help_text)
+        session.commit()
 
-
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = chat_id_to_chat(update.effective_chat.id)
-    if chat.callback_message is None:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="No operation to cancel")
-        return
-
-    await chat.callback_message.edit_reply_markup(reply_markup=None)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="Operation cancelled")
+        return ConversationHandler.END
 
 
-# --- Setting chats ---
-@guard(chat_not_assigned_check, no_callback_check)
+# --- Creating teams ---
+@no_callback_graceful_fail
 async def create_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    while True:
-        game_id = random.randint(100000, 999999)
-        if game_id not in games:
-            break
+    with Session(engine) as session:
+        while True:
+            game_id = random.randint(100000, 999999)
+            if session.get(Game, game_id) is None:
+                break
 
-    games[game_id] = Game(game_id=game_id, admin_chat=Chat(update.effective_chat.id))
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=(
-            f"New game created with game id: {game_id}, this chat is the admin chat of the game\n\n"
-            "Use this id to set the team and location chats via /create_team_<team number> and /create_location_chat"
-        ),
-    )
+        chat_id = get_chat_id(update)
 
+        session.add(Game(game_id=game_id))
+        session.flush()
+        session.add(GameChat(chat_id=chat_id, game_id=game_id, role=ChatRole.ADMIN))
+        session.commit()
 
-@guard(valid_game_id_check, chat_not_assigned_check, no_callback_check)
-async def _create_team_helper(update: Update, context: ContextTypes.DEFAULT_TYPE, team_index: int):
-    game_id = int(context.args[0])
-    game = games[game_id]
-
-    if game.teams[team_index] is not None:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"Team {team_index + 1} already exists for this game\n\n"
-                "Please choose a different team number or ask your admin to delete the chat for this team"
+        _ = await context.bot.send_message(
+            chat_id,
+            (
+                f"New game created with game id: {game_id}, this chat is the admin chat of the game\n\n"
+                "Use this id to set the team and location chats via /create_team_<team number> and /create_location_chat"
             ),
         )
-        return
-
-    game.teams[team_index] = Team(chat=Chat(update.effective_chat.id))
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, text=f"This chat has been assigned to Team {team_index + 1}.",
-    )
 
 
-async def create_team_1_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _create_team_helper(update, context, 0)
+def create_team_handler_generator(team_num: Literal[1, 2, 3]):
+    @no_callback_graceful_fail
+    async def create_team_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        with Session(engine) as session:
+            game = get_game(session, context)
+            if getattr(game, f"team_{team_num}_chat") is not None:
+                raise CheckFailedError(
+                    f"Team chat already exists, choose another team number or ask your admin to delete team {team_num}'s chat",
+                )
+
+            chat_id = get_chat_id(update)
+            team_chat = GameChat(chat_id=chat_id, game_id=game.game_id, role=ChatRole(f"team_{team_num}"))
+            session.add(team_chat)
+            session.flush()
+
+            cards = session.scalars(select(Card).where(Card.card_type != CardType.RULE)).all()
+            for card in cards:
+                session.add(
+                    TeamCardJoin(
+                        team_chat_id=team_chat.chat_id,
+                        card_id=card.card_id,
+                        state=CardState.UNDRAWN,
+                    ),
+                )
+            session.commit()
+
+        _ = await context.bot.send_message(
+            chat_id,
+            f"This chat has been assigned to team {team_num}",
+        )
+
+    return create_team_handler
 
 
-async def create_team_2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _create_team_helper(update, context, 1)
-
-
-async def create_team_3_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _create_team_helper(update, context, 2)
-
-
-@guard(valid_game_id_check, chat_not_assigned_check, no_callback_check)
+@no_callback_graceful_fail
 async def create_location_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game_id = int(context.args[0])
-    games[game_id].location_chat = Chat(update.effective_chat.id)
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, text="This chat has been assigned as the location chat",
-    )
+    with Session(engine) as session:
+        game = get_game(session, context)
+        if game.location_chat is not None:
+            raise CheckFailedError(
+                f"Location chat already exists, choose another team number or ask your admin to delete the location chat",
+            )
+
+        chat_id = get_chat_id(update)
+        location_chat = GameChat(chat_id=chat_id, game_id=game.game_id, role=ChatRole.LOCATION)
+        session.add(location_chat)
+        session.commit()
+
+        _ = await context.bot.send_message(
+            chat_id,
+            f"This chat has been assigned as the location chat",
+        )
 
 
 # --- Deleting chats (admin only) ---
-@guard(is_admin_chat_check, game_not_started_check, no_callback_check)
-async def delete_all_chats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
-    del games[game.game_id]
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="The game and all associated chat assignments have been deleted",
-    )
+@no_callback_graceful_fail
+async def delete_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with Session(engine) as session:
+        game = admin_get_game(session, update)
+        session.delete(game)
+        session.commit()
+
+        _ = await context.bot.send_message(
+            get_chat_id(update),
+            "Game successfully deleted, all chats have been unassigned",
+        )
 
 
-@guard(is_admin_chat_check, game_not_started_check, no_callback_check)
-async def _delete_team_helper(update: Update, context: ContextTypes.DEFAULT_TYPE, team_index: int):
-    game = chat_id_to_game(update.effective_chat.id)
-    game.teams[team_index] = None
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"Team {team_index + 1} chat assignment has been deleted",
-    )
-
-
-@guard(team_chat_is_assigned_check(0))
-async def delete_team_1_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _delete_team_helper(update, context, 0)
-
-
-@guard(team_chat_is_assigned_check(1))
-async def delete_team_2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _delete_team_helper(update, context, 1)
-
-
-@guard(team_chat_is_assigned_check(2))
-async def delete_team_3_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _delete_team_helper(update, context, 2)
-
-
-@guard(is_admin_chat_check, game_not_started_check, location_chat_is_assigned_check, no_callback_check)
-async def delete_location_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
-    game.location_chat_id = None
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="The location chat assignment has been deleted",
-    )
-
-
-# --- Drawing cards helper functions ---
-def _draw_tasks(team: Team, num_tasks: int, *, extremes_only=False) -> list[Task]:
-    random.shuffle(team.undrawn_tasks)
-    if not extremes_only:
-        new_tasks = team.undrawn_tasks[:num_tasks]
-        team.shown_tasks += new_tasks
-        team.undrawn_tasks = team.undrawn_tasks[num_tasks:]
-    else:
-        count = 0
-        new_tasks = []
-        while count < 3:
-            task = team.undrawn_tasks.pop(0)
-            if task.type == "extreme":
-                team.shown_tasks.append(task)
-                new_tasks.append(task)
-                count += 1
+def delete_team_handler_generator(team_num: Literal[1, 2, 3]):
+    @no_callback_graceful_fail
+    async def delete_team_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        with Session(engine) as session:
+            game = admin_get_game(session, update)
+            team_chat: GameChat | None = cast(GameChat | None, getattr(game, f"team_{team_num}_chat"))
+            if team_chat is None:
+                raise CheckFailedError(f"Team {team_num} chat does not exist, cannot delete")
             else:
-                team.undrawn_tasks.append(task)
+                session.delete(team_chat)
+                session.commit()
 
-    return new_tasks
+            _ = await context.bot.send_message(
+                get_chat_id(update),
+                f"Team {team_num} chat successfully deleted, team can now create a new chat assignment",
+            )
 
-def _draw_powerups(team: Team, num_powerups: int) -> list[Powerup]:
-    random.shuffle(team.undrawn_powerups)
-    new_powerups = team.undrawn_powerups[:num_powerups]
-    team.shown_powerups += new_powerups
-    team.undrawn_powerups = team.undrawn_powerups[num_powerups:]
-    return new_powerups
+    return delete_team_handler
 
-def _select_task(team: Team, task_index: int, *, delete_shown_tasks=True) -> Task:
-    task = team.shown_tasks.pop(task_index)
-    team.drawn_tasks.append(task)
 
-    if delete_shown_tasks:
-        team.undrawn_tasks += team.shown_tasks
-        team.shown_tasks = []
+@no_callback_graceful_fail
+async def delete_location_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with Session(engine) as session:
+        game = admin_get_game(session, update)
+        location_chat: GameChat | None = game.location_chat
+        if location_chat is None:
+            raise CheckFailedError(f"Location chat does not exist, cannot delete")
+        else:
+            session.delete(location_chat)
+            session.commit()
 
-    return task
-
-def _select_powerup(team: Team, powerup_index: int) -> Powerup:
-    powerup = team.shown_powerups.pop(powerup_index)
-    team.drawn_powerups.append(powerup)
-    team.undrawn_powerups += team.shown_powerups
-    team.shown_powerups = []
-    return powerup
-
-async def _send_task_select_keyboard(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    team = chat_id_to_team(chat_id)
-    keyboard = [[InlineKeyboardButton(
-        text=f"Task {task_index + 1}", callback_data=CompleteTaskCallbacks.SELECT_TASK + f":{task_index}",
-    )] for task_index in range(len(team.shown_tasks))]
-    team.chat.callback_message = await context.bot.send_message(
-        chat_id=chat_id, text="Select your task:", reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-async def _send_powerup_select_keyboard(chat_id, context: ContextTypes.DEFAULT_TYPE):
-    team = chat_id_to_team(chat_id)
-    keyboard = [[InlineKeyboardButton(
-        text=f"Powerup {powerup_index + 1}", callback_data=CompleteTaskCallbacks.SELECT_TASK + f":{powerup_index}",
-    )] for powerup_index in range(len(team.shown_tasks))]
-    team.chat.callback_message = await context.bot.send_message(
-        chat_id=chat_id, text="Select your powerup:", reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-async def _select_task_callback(update: Update):
-    query = update.callback_query
-    await query.answer()
-    await update.effective_message.delete()
-
-    team = chat_id_to_team(update.effective_chat.id)
-
-    task_index = int(query.data.split(":")[-1])
-    _select_task(team, task_index)
-
-async def _select_powerup_callback(update: Update):
-    query = update.callback_query
-    await query.answer()
-    await update.effective_message.delete()
-
-    team = chat_id_to_team(update.effective_chat.id)
-
-    powerup_index = int(query.data.split(":")[-1])
-    _select_powerup(team, powerup_index)
+        _ = await context.bot.send_message(
+            get_chat_id(update),
+            f"Location chat successfully deleted, a new location chat can now be created",
+        )
 
 
 # --- Starting and ending games ---
+class StartCycleStates(Enum):
+    DRAWING_TASKS = auto()
+
+
+class StartCycleActions(Enum):
+    SELECT_TASK = auto()
+
+
 async def _start_cycle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
-    running_team = game.game_state.running_team
+    with Session(engine) as session:
+        game = to_started_game(admin_get_game(session, update))
+        running_chat_id = game.running_team_chat.chat_id
+        for team_num in range(1, 4):
+            team_chat: GameChat = cast(GameChat, getattr(game, f"team_{team_num}_chat"))
+            if team_chat.chat_id == running_chat_id:
+                text = "The game has started! You are the runners, please send your location into the location chat"
+            else:
+                text = "The game has started! You are the chasers, please wait 20 minutes before starting your chase"
+            _ = await context.bot.send_message(team_chat.chat_id, text)
 
-    for team in game.teams:
-        if team != running_team:
-            text = "The game has started! You are the chasers, please wait 20 minutes before starting your chase"
-        else:
-            text = "The game has started! You are the runners, please send your location into the location chat"
-        await context.bot.send_message(chat_id=team.chat.chat_id, text=text)
+        for task in show_tasks(session, running_chat_id, 3):
+            _ = await context.bot.send_photo(running_chat_id, task.image_path)
 
-    for task in _draw_tasks(running_team, 3):
-        await context.bot.send_photo(chat_id=running_team.chat.chat_id, photo=task.image)
-    await _send_task_select_keyboard(running_team.chat.chat_id, context)
+        keyboard_markup = select_card_keyboard_markup(
+            session, running_chat_id, TaskCard, StartCycleActions.SELECT_TASK
+        )
+        callback_message = await context.bot.send_message(
+            running_chat_id, "Select your task:", reply_markup=keyboard_markup,
+        )
+        game.running_team_chat.callback_message_id = callback_message.message_id
 
-@guard(is_admin_chat_check, game_not_started_check, chats_all_assigned_check, no_callback_check)
+        session.commit()
+
+
+@no_callback_graceful_fail
 async def start_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
+    with (Session(engine) as session):
+        game = admin_get_game(session, update)
+        if game.is_started:
+            raise CheckFailedError("Game is already started")
 
-    game.game_state.is_started = True
-    game.game_state.running_team = game.teams[0]
+        missing_chats: list[str] = []
+        if game.location_chat is None:
+            missing_chats.append("location")
+        if game.team_1_chat is None:
+            missing_chats.append("team_1")
+        if game.team_2_chat is None:
+            missing_chats.append("team_2")
+        if game.team_3_chat is None:
+            missing_chats.append("team_3")
 
-    await _start_cycle(update, context)
+        if len(missing_chats) > 0:
+            raise CheckFailedError(f"Missing required chats: {', '.join(missing_chats)}")
 
-@guard(is_admin_chat_check, game_is_started_check, no_callback_check)
+        game.running_team_chat_id = cast(GameChat, game.team_1_chat).chat_id
+        session.flush()
+
+        game.is_started = True
+        session.commit()
+
+        await _start_cycle(update, context)
+
+
+@no_callback_graceful_fail
 async def end_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
+    with Session(engine) as session:
+        game = admin_get_game(session, update)
+        if not game.is_started:
+            raise CheckFailedError("Game is not started")
 
-    game.game_state.is_started = False
+        game.is_started = False
+        session.commit()
 
-
-@guard(is_admin_chat_check, game_is_started_check, game_not_paused_check, no_callback_check)
-async def catch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
-
-    game.game_state.is_paused = True
-    game.game_state.cycle_num += 1
-    game.game_state.all_or_nothing = game.game_state.buy_get_free = False
-
-    for team_index, team in enumerate(game.teams):
-        if team == game.game_state.running_team:
-            game.game_state.running_team = game.teams[(team_index + 1) % 3]
-
-            team.undrawn_tasks += team.shown_tasks + team.drawn_tasks
-            team.undrawn_powerups = all_powerups.copy()
-            team.shown_tasks = []
-            team.drawn_tasks = []
-            team.shown_powerups = []
-            team.drawn_powerups = []
-
-        if team.chat.callback_message is not None:
-            await team.chat.callback_message.delete()
-            team.chat.callback_message = None
-
-        await context.bot.send_message(
-            chat_id=team.chat.chat_id,
-            text="The runners have been caught and the game has been paused, it will be restarted by an admin soon"
+        _ = await context.bot.send_message(
+            get_chat_id(update),
+            "Game successfully ended, teams can now wait for the next game or ask their admin to restart the game",
         )
 
-@guard(is_admin_chat_check, game_is_started_check, game_is_paused_check, no_callback_check)
+
+@no_callback_graceful_fail
+async def catch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with Session(engine) as session:
+        game = admin_get_game(session, update)
+        started_game = to_started_game(game)
+        if started_game.is_paused:
+            raise CheckFailedError("Game is currently paused, cannot register catch")
+
+        running_team_chat = started_game.running_team_chat
+        if running_team_chat.callback_message_id is not None:
+            _ = await context.bot.edit_message_reply_markup(
+                get_chat_id(update), running_team_chat.callback_message_id, reply_markup=None,
+            )
+
+        for team_card_join in running_team_chat.team_card_joins:
+            if team_card_join.state == CardState.SHOWN:
+                team_card_join.state = CardState.UNDRAWN
+            elif team_card_join.state == CardState.DRAWN:
+                team_card_join.state = CardState.USED
+
+        running_team_num = int(running_team_chat.role.value.split("_")[-1])
+        new_running_team_chat = cast(GameChat, getattr(started_game, f"team_{(running_team_num + 1) % 3}_chat"))
+        game.running_team_chat_id = new_running_team_chat.chat_id
+
+        game.is_paused = True
+        game.all_or_nothing_active = False
+        game.buy_1_get_1_free_active = False
+        session.commit()
+
+        _ = await context.bot.send_message(
+            get_chat_id(update),
+            "Catch registered, the next team is now the running team. Use /restart_game to start the next cycle.",
+        )
+
+
+@no_callback_graceful_fail
 async def restart_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game = chat_id_to_game(update.effective_chat.id)
+    with Session(engine) as session:
+        game = admin_get_game(session, update)
+        started_game = to_started_game(game)
+        if not started_game.is_paused:
+            raise CheckFailedError("Game is not paused, cannot restart game")
 
-    game.game_state.is_paused = False
+        game.is_paused = False
+        session.commit()
 
-    await _start_cycle(update, context)
+        await _start_cycle(update, context)
 
-# --- Complete task conversation handlers ---
-class CompleteTaskStates(StrEnum):
-    @override
-    @staticmethod
-    def _generate_next_value_(name, start, count, last_values):
-        return "complete_task:" + name.lower()
 
-    REVEAL_ADDITIONAL = auto()
-    SELECTING_3_TASKS = auto()
-    SELECTING_6_TASKS = auto()
-    SELECTING_3_POWERUPS = auto()
+@graceful_fail
+async def select_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with Session(engine) as session:
+        selected_task = await select_card(session, update, context, TaskCard)
 
-class CompleteTaskCallbacks(StrEnum):
-    @override
-    @staticmethod
-    def _generate_next_value_(name, start, count, last_values):
-        return "complete_task:" + name.lower()
+        _ = await context.bot.send_message(get_chat_id(update), "You have selected the following task:")
+        _ = await context.bot.send_photo(get_chat_id(update), selected_task.image_path)
 
-    REVEAL_ADDITIONAL_TASKS = auto()
-    REVEAL_ADDITIONAL_POWERUPS = auto()
+        session.commit()
+
+    return ConversationHandler.END
+
+
+# --- Complete task handlers ---
+class CompleteTaskActions(Enum):
+    REVEAL_TASKS_OR_POWERUPS = auto()
     SELECT_TASK = auto()
     SELECT_POWERUP = auto()
+    FULLERTON = auto()
+    B1G1F = auto()
+    DREW_B1G1F = auto()
+
+@no_callback_graceful_fail
+async def complete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pass
 
 
-@guard(game_is_started_check, game_not_paused_check, no_callback_check, is_runner_check)
-async def complete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    team = chat_id_to_team(update.effective_chat.id)
-
-    for task in _draw_tasks(team, 3):
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=task.image)
-
-    keyboard = [
-        [InlineKeyboardButton(text="Reveal 3 more tasks", callback_data=CompleteTaskCallbacks.REVEAL_ADDITIONAL_TASKS)],
-        [InlineKeyboardButton(text="Reveal 3 more powerups", callback_data=CompleteTaskCallbacks.REVEAL_ADDITIONAL_POWERUPS)],
-    ]
-    team.chat.callback_message = await context.bot.send_message(
-        chat_id=update.effective_chat.id, text="You may reveal 3 more tasks or 3 more powerups",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CompleteTaskStates.REVEAL_ADDITIONAL
-
-@guard(game_is_started_check, game_not_paused_check, is_runner_check)
-async def reveal_additional_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    await update.effective_message.delete()
-
-    team = chat_id_to_team(update.effective_chat.id)
-    for task in _draw_tasks(team, 3):
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=task.image)
-    await _send_task_select_keyboard(update.effective_chat.id, context)
-
-    return CompleteTaskStates.SELECTING_6_TASKS
-
-@guard(game_is_started_check, game_not_paused_check, is_runner_check)
-async def reveal_additional_powerups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    await update.effective_message.delete()
-
-    team = chat_id_to_team(update.effective_chat.id)
-
-    for powerup in _draw_powerups(team, 3):
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=powerup.image)
-    await _send_task_select_keyboard(update.effective_chat.id, context)
-
-    return CompleteTaskStates.SELECTING_3_TASKS
-
-@guard(game_is_started_check, game_not_paused_check, is_runner_check)
-async def select_3_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    await _select_task_callback(update)
-
-    team = chat_id_to_team(update.effective_chat.id)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="You have chosen this task:")
-    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=team.drawn_tasks[0].image)
-
-    await _send_powerup_select_keyboard(update, context)
-
-    return CompleteTaskStates.SELECTING_3_POWERUPS
-
-@guard(game_is_started_check, game_not_paused_check, is_runner_check)
-async def select_3_powerups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _select_powerup_callback(update)
-
-    team = chat_id_to_team(update.effective_chat.id)
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, text="You currently have the following powerups:"
-    )
-    for powerup in team.drawn_powerups:
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=powerup.image)
-
-    return ConversationHandler.END
-
-@guard(game_is_started_check, game_not_paused_check, is_runner_check)
-async def select_6_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _select_task_callback(update)
-
-    team = chat_id_to_team(update.effective_chat.id)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="You have chosen this task:")
-    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=team.drawn_tasks[0].image)
-
-    return ConversationHandler.END
-
-# --- Assigning handlers ---
-def set_handlers(application: Application):
+# --- Setting handlers ---
+def set_handlers(application: Application[Any, Any, Any, Any, Any, Any]) -> None:  # pyright: ignore [reportExplicitAny]
     handlers = [
         CommandHandler("start", start_handler),
         CommandHandler("help", help_handler),
         CommandHandler("cancel", cancel_handler),
-        CommandHandler("create_game", create_game_handler),
-        CommandHandler("create_team_1", create_team_1_handler, has_args=True),
-        CommandHandler("create_team_2", create_team_2_handler, has_args=True),
-        CommandHandler("create_team_3", create_team_3_handler, has_args=True),
-        CommandHandler("create_location_chat", create_location_chat_handler, has_args=True),
 
-        ConversationHandler(
-            entry_points=[CommandHandler("complete_task", complete_task_handler)],
-            states={
-                CompleteTaskStates.REVEAL_ADDITIONAL: [
-                    CallbackQueryHandler(
-                        reveal_additional_tasks_handler, CompleteTaskCallbacks.REVEAL_ADDITIONAL_TASKS
-                    ),
-                    CallbackQueryHandler(
-                        reveal_additional_powerups_handler, CompleteTaskCallbacks.REVEAL_ADDITIONAL_POWERUPS
-                    )
-                ],
-                CompleteTaskStates.SELECTING_3_TASKS: [CallbackQueryHandler(
-                    select_3_tasks_handler, CompleteTaskCallbacks.SELECT_TASK
-                )],
-                CompleteTaskStates.SELECTING_3_POWERUPS: [CallbackQueryHandler(
-                    select_3_powerups_handler, CompleteTaskCallbacks.SELECT_POWERUP
-                )],
-                CompleteTaskStates.SELECTING_6_TASKS: [CallbackQueryHandler(
-                    select_6_tasks_handler, CompleteTaskCallbacks.SELECT_TASK
-                )]
-            },
-            fallbacks=[CommandHandler("cancel", cancel_handler)]
-        )
+        CommandHandler("create_game", create_game_handler),
+        CommandHandler("create_team_1", create_team_handler_generator(1)),
+        CommandHandler("create_team_2", create_team_handler_generator(2)),
+        CommandHandler("create_team_3", create_team_handler_generator(3)),
+        CommandHandler("create_location_chat", create_location_chat_handler),
+
+        CommandHandler("delete_game", delete_game_handler),
+        CommandHandler("delete_team_1", delete_team_handler_generator(1)),
+        CommandHandler("delete_team_2", delete_team_handler_generator(2)),
+        CommandHandler("delete_team_3", delete_team_handler_generator(3)),
+        CommandHandler("delete_location_chat", delete_location_chat_handler),
+
+        CommandHandler("end_game", end_game_handler),
+        CommandHandler("catch", catch_handler),
+
+        CommandHandler("start_game", start_game_handler),
+        CommandHandler("restart_game", restart_game_handler),
+        CallbackQueryHandler(select_task_handler, enum_callback_pattern(StartCycleActions.SELECT_TASK)),
     ]
 
     application.add_handlers(handlers)
