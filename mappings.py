@@ -1,4 +1,4 @@
-from enum import StrEnum
+from enum import StrEnum, Enum, auto
 from typing import ClassVar, final
 from sqlalchemy import Constraint, ForeignKey, UniqueConstraint, and_, CheckConstraint
 from sqlalchemy.orm import Mapped, MappedAsDataclass, DeclarativeBase, mapped_column, relationship
@@ -119,6 +119,13 @@ class GameChat(Base):
         CheckConstraint("score IS NULL OR role IN ('TEAM_1', 'TEAM_2', 'TEAM_3')", name="score_only_for_team_chats"),
     )
 
+class B1G1FStates(Enum):
+    INACTIVE = auto()  # powerup not used
+    NONE_DRAWN = auto()  # powerup used, no cards drawn
+    ONE_DRAWN = auto()  # powerup used, one card drawn
+    BOTH_DRAWN = auto()  # powerup used, both cards drawn
+    ONE_COMPLETED = auto()  # powerup used, one of two cards completed
+
 @final
 class Game(Base):
     __tablename__ = "Game"
@@ -127,11 +134,8 @@ class Game(Base):
     is_started: Mapped[bool] = mapped_column(default=False)
     is_paused: Mapped[bool] = mapped_column(default=False)
 
-    all_or_nothing_active: Mapped[bool] = mapped_column(default=False)
-    buy_1_get_1_free_active: Mapped[bool] = mapped_column(default=False)
-    buy_1_get_1_free_used: Mapped[bool] = mapped_column(default=False)
-    fullerton_early: Mapped[bool | None] = mapped_column(default=None)
-    mbs_draw_num: Mapped[int | None] = mapped_column(default=None)
+    all_or_nothing: Mapped[bool] = mapped_column(default=False)
+    B1G1F: Mapped[B1G1FStates] = mapped_column(default=B1G1FStates.INACTIVE)  # REFER TO PPT ^&@!^#&*@!^#&^!@*&#^#&*
 
     running_team_chat_id: Mapped[int | None] = mapped_column(ForeignKey("Chat.chat_id"), default=None)
 
@@ -204,4 +208,8 @@ class TeamCardJoin(Base):
 
     team_chat: Mapped[GameChat] = relationship(back_populates="team_card_joins", foreign_keys=[team_chat_id], init=False)
     card: Mapped[Card] = relationship(back_populates="team_card_joins", foreign_keys=[card_id], init=False)
+
+    __table_args__: tuple[Constraint, ...] = (
+        UniqueConstraint(team_chat_id, card_id, name="unique_team_card"),
+    )
 

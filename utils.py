@@ -1,18 +1,18 @@
-from enum import Enum
 import re
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import cast
 
-from sqlalchemy import Select, func, select
-from sqlalchemy.orm import Session
-from telegram import Update, InlineKeyboardButton, CallbackQuery, InlineKeyboardMarkup
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session, joinedload
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from db import engine
-from mappings import ChatRole, PowerupCard, TaskSpecial, TaskType, TaskCard, PowerupSpecial, RuleCard, GameChat, Game, \
+from mappings import B1G1FStates, Card, ChatRole, PowerupCard, TaskSpecial, TaskType, TaskCard, PowerupSpecial, RuleCard, GameChat, \
+    Game, \
     TeamCardJoin, CardState
 
 # --- Loading cards ---
@@ -32,12 +32,6 @@ all_powerups = []
 all_rules = []
 
 def _make_cards(root_path: Path) -> None:
-    """
-    Loads cards from the given directory into the database.
-
-    :param root_path: Path to the directory containing card images
-    :return:
-    """
     with Session(engine) as session:
         for card_path in sorted(root_path.iterdir()):
             if not card_path.is_file():
@@ -87,7 +81,7 @@ class StartedGame:
 
     is_paused: bool
     all_or_nothing: bool
-    buy_1_get_1_free: bool
+    B1G1F: B1G1FStates
 
 # --- Checks ---
 class CheckFailedError(Exception):
@@ -95,27 +89,20 @@ class CheckFailedError(Exception):
 
 type HandlerType[OutT] = Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[None, None, OutT]]
 def graceful_fail[T](f: HandlerType[T]) -> HandlerType[T | None]:
-    """
-    Decorator to catch CheckFailedError exceptions and send the error message to the user.
-    """
-
     @wraps(f)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
+    async def wrapper(tele_update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
         try:
-            return await f(update, context)
+            return await f(tele_update, context)
         except CheckFailedError as e:
-            _ = await context.bot.send_message(get_chat_id(update), str(e))
+            _ = await context.bot.send_message(get_chat_id(tele_update), str(e))
 
     return wrapper
 
-def no_callback_check(update: Update):
-    """
-    Check if there is an ongoing callback operation in the chat.
-    """
+def no_callback_check(tele_update: Update):
     with Session(engine) as session:
         chat: GameChat | None = None
         try:
-            chat = get_chat(session, update)
+            chat = get_game_chat_or_raise(session, tele_update)
         except CheckFailedError:
             pass
 
@@ -123,45 +110,30 @@ def no_callback_check(update: Update):
             raise CheckFailedError("Finish or cancel the current callback operation first")
 
 def no_callback_graceful_fail[T](f: HandlerType[T]) -> HandlerType[T | None]:
-    """
-    Decorator to check that the chat has no ongoing callbacks,
-    catch CheckFailedError exceptions and send the error message to the user.
-    """
     @wraps(f)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
+    async def wrapper(tele_update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
         try:
-            no_callback_check(update)
-            return await f(update, context)
+            no_callback_check(tele_update)
+            return await f(tele_update, context)
         except CheckFailedError as e:
-            _ = await context.bot.send_message(get_chat_id(update), str(e))
+            _ = await context.bot.send_message(get_chat_id(tele_update), str(e))
 
     return wrapper
 
 
-# --- Database helper functions ---
-def get_chat_id(update: Update) -> int:
-    """
-    Gets the chat ID from the update, throws RuntimeError if the update has no effective chat.
-    """
-    if update.effective_chat is None:
+# --- Helper functions ---
+def get_chat_id(tele_update: Update) -> int:
+    if tele_update.effective_chat is None:
         raise RuntimeError("Update has no effective chat")
-    return update.effective_chat.id
+    return tele_update.effective_chat.id
 
-def get_chat(session: Session, update: Update) -> GameChat:
-    """
-    Gets the GameChat associated with the chat in the update,
-    raises CheckFailedError if there is no GameChat associated with the update.
-    """
-    chat: GameChat | None = session.get(GameChat, get_chat_id(update))
+def get_game_chat_or_raise(session: Session, tele_update: Update) -> GameChat:
+    chat: GameChat | None = session.get(GameChat, get_chat_id(tele_update))
     if chat is None:
         raise CheckFailedError("Chat is not assigned to any role")
     return chat
 
-def get_game(session: Session, context: ContextTypes.DEFAULT_TYPE) -> Game:
-    """
-    Gets the GameChat associated with the chat in the update,
-    raises CheckFailedError if there is no GameChat associated with the update.
-    """
+def validate_game_id(session: Session, context: ContextTypes.DEFAULT_TYPE) -> Game:
     if context.args is None or len(context.args) != 1 or (re.fullmatch(r"\d{6}", context.args[0]) is None):
         raise CheckFailedError("Please provide a valid game id")
 
@@ -172,33 +144,32 @@ def get_game(session: Session, context: ContextTypes.DEFAULT_TYPE) -> Game:
 
     return game
 
-def admin_get_game(session: Session, update: Update) -> Game:
-    """
-    Gets the Game associated with the admin chat in the update,
-    raises CheckFailedError if the chat is not an admin chat.
-    """
-    chat = get_chat(session, update)
-    game = chat.game
-    if chat.chat_id != game.admin_chat.chat_id:
-        raise CheckFailedError("This is not an admin chat")
+def ensure_admin_chat(session: Session, tele_update: Update) -> GameChat:
+    chat = get_game_chat_or_raise(session, tele_update)
+    if chat.role != ChatRole.ADMIN:
+        raise CheckFailedError("This chat is not an admin chat")
 
-    return game
+    return chat
+
+def ensure_running_team_chat(session: Session, tele_update: Update) -> GameChat:
+    chat = get_game_chat_or_raise(session, tele_update)
+    if chat.role not in [ChatRole.TEAM_1, ChatRole.TEAM_2, ChatRole.TEAM_3]:
+        raise CheckFailedError("This chat is not a team chat")
+
+    if chat.game.running_team_chat_id != chat.chat_id:
+        raise CheckFailedError("Your team is not currently running")
+
+    return chat
 
 def to_started_game(game: Game) -> StartedGame:
-    """
-    Converts a Game to a StartedGame, raises CheckFailedError if the game is not started.
-
-    StartedGame is a convenience class that guarantees that all necessary chats for a game are not None,
-    to help with type checking
-    """
     if not game.is_started:
         raise CheckFailedError("Game is not started, please wait for your admin to start the game")
 
-    assert game.location_chat is not None
-    assert game.team_1_chat is not None
-    assert game.team_2_chat is not None
-    assert game.team_3_chat is not None
-    assert game.running_team_chat is not None
+    assert game.location_chat is not None, "SQL trigger failed to ensure location chat exists for started game"
+    assert game.team_1_chat is not None, "SQL trigger failed to ensure team 1 chat exists for started game"
+    assert game.team_2_chat is not None, "SQL trigger failed to ensure team 2 chat exists for started game"
+    assert game.team_3_chat is not None, "SQL trigger failed to ensure team 3 chat exists for started game"
+    assert game.running_team_chat is not None, "SQL trigger failed to ensure running team chat exists for started game"
 
     return StartedGame(
         game_id=game.game_id,
@@ -209,68 +180,67 @@ def to_started_game(game: Game) -> StartedGame:
         team_3_chat=game.team_3_chat,
         running_team_chat=game.running_team_chat,
         is_paused=game.is_paused,
-        all_or_nothing=game.all_or_nothing_active,
-        buy_1_get_1_free=game.buy_1_get_1_free_active,
+        all_or_nothing=game.all_or_nothing,
+        B1G1F=game.B1G1F,
     )
 
+def get_tasks(session: Session, chat_id: int, card_state: CardState) -> Sequence[TaskCard]:
+    return session.scalars(
+        select(TaskCard)
+        .join(TeamCardJoin, TaskCard.card_id == TeamCardJoin.card_id)
+        .where(
+            TeamCardJoin.state == card_state,
+            TeamCardJoin.team_chat_id == chat_id,
+        ),
+    ).all()
+
+def get_powerups(session: Session, chat_id: int, card_state: CardState) -> Sequence[PowerupCard]:
+    return session.scalars(
+        select(PowerupCard)
+        .join(TeamCardJoin, PowerupCard.card_id == TeamCardJoin.card_id)
+        .where(
+            TeamCardJoin.state == card_state,
+            TeamCardJoin.team_chat_id == chat_id,
+        ),
+    ).all()
 
 # --- Enum formatter ---
-def format_enum_callback(enum_value: Enum) -> str:
+def card_callback_generator(enum_value: Enum) -> str:
     """
-    Formats an enum value into a string suitable for use as a callback data prefix.
+    Converts Enum value to a callback data string in the format "enum_class_name:member_name".
     """
     enum_class_name = enum_value.__class__.__name__
     class_name_snake = ''.join(['_' + c.lower() if c.isupper() else c for c in enum_class_name]).lstrip('_')
     member_name_lower = enum_value.name.lower()
     return f"{class_name_snake}:{member_name_lower}"
 
-def enum_callback_pattern(enum_value: Enum) -> str:
+def card_callback_pattern(enum_value: Enum) -> str:
     """
-    Returns a regex pattern string to match callback data for the given enum value.
+    Converts Enum value to regex matching callback data provided by card_callback_generator.
     """
-    return f"^{format_enum_callback(enum_value)}"
+    return f"^{card_callback_generator(enum_value)}"
 
 
 # --- Drawing cards helper functions ---
-def get_running_team_chat(session: Session, update: Update) -> GameChat:
-    """
-    Returns the GameChat associated with the update if it is a team chat and the team is currently running,
-    raises CheckFailedError otherwise.
-    """
-    chat_id = get_chat_id(update)
-    chat: GameChat | None = session.get(GameChat, chat_id)
-    if chat is None or chat.role not in [ChatRole.TEAM_1, ChatRole.TEAM_2, ChatRole.TEAM_3]:
-        raise CheckFailedError("This chat is not a team chat")
-
-    if chat.game.running_team_chat_id != chat.chat_id:
-        raise CheckFailedError("Your team is not currently running")
-
-    return chat
-
-def _show_cards_query[T: (TaskCard, PowerupCard)](chat_id: int, card_type: type[T]) -> Select[tuple[T, TeamCardJoin]]:
-    """
-    Returns a query to select undrawn cards of the given type for the given chat ID.
-    """
-    return (
-        select(card_type, TeamCardJoin)
-        .join(TeamCardJoin, TeamCardJoin.card_id == card_type.card_id)
+def generate_shown_tasks(session: Session, chat_id: int, num_cards: int, extremes_only: bool) -> list[TaskCard]:
+    query = (
+        select(TaskCard, TeamCardJoin)
+        .join(TeamCardJoin, TeamCardJoin.card_id == TaskCard.card_id)
         .where(
             TeamCardJoin.team_chat_id == chat_id,
             TeamCardJoin.state == CardState.UNDRAWN,
         )
     )
-
-def _execute_show_cards_query[T: (TaskCard, PowerupCard)](
-    session: Session, query: Select[tuple[T, TeamCardJoin]], num_cards: int
-) -> list[T]:
-    """
-    Executes the given query to select cards, updates their states to SHOWN, and returns the shown cards.
-    """
+    if extremes_only:
+        query = (
+            query
+            .where(TaskCard.task_type == TaskType.EXTREME)
+        )
     result = session.execute(
         query.order_by(func.random()).limit(num_cards)
     )
 
-    shown_cards: list[T] = []
+    shown_cards: list[TaskCard] = []
     for row in result:
         card, team_card_join = row.tuple()
         team_card_join.state = CardState.SHOWN
@@ -279,94 +249,84 @@ def _execute_show_cards_query[T: (TaskCard, PowerupCard)](
     if len(shown_cards) < num_cards:
         raise CheckFailedError("Not enough tasks left to show")
 
+    session.commit()
+
     return shown_cards
 
-def show_tasks(session: Session, chat_id: int, num_cards: int, extremes_only: bool = False) -> list[TaskCard]:
-    """
-    Sets num_cards randomly selected undrawn tasks to SHOWN state and returns them,
-    if extremes_only is True then only extreme tasks can be shown.
-    """
-    query = _show_cards_query(chat_id, TaskCard)
-    if extremes_only:
-        query = (
-            query
-            .where(TaskCard.task_type == TaskType.EXTREME)
-        )
-    return _execute_show_cards_query(session, query, num_cards)
-
-def show_powerups(session: Session, chat_id: int, num_cards: int) -> list[PowerupCard]:
-    """
-    Sets num_cards randomly selected undrawn powerups to SHOWN state and returns them.
-    """
-    query = _show_cards_query(chat_id, PowerupCard)
-    return _execute_show_cards_query(session, query, num_cards)
-
-async def select_card[T: (TaskCard, PowerupCard)](
-    session: Session, update: Update, context: ContextTypes.DEFAULT_TYPE, card_type: type[T]
-) -> T:
-    """
-    Selects a card based on the callback query data, clears the callback message and returns the selected card.
-    """
-    query = cast(CallbackQuery, update.callback_query)
-    _ = await query.answer()
-
-    chat = get_chat(session, update)
-    if chat.callback_message_id is not None:
-        _ = await context.bot.edit_message_reply_markup(
-            get_chat_id(update), chat.callback_message_id, reply_markup=None,
-        )
-
-    card_id = int(cast(str, query.data).split(":")[-1])
-    return db_select_card(session, update, card_id, card_type)
-
-def db_select_card[T: (TaskCard, PowerupCard)](session: Session, update: Update, card_id: int, card_type: type[T]) -> T:
-    """
-    Sets the selected card to DRAWN state and all other SHOWN cards to UNDRAWN state, returns the selected card.
-    """
-    chat = get_running_team_chat(session, update)
-
-    result = session.execute(
-        select(card_type, TeamCardJoin)
-        .join(TeamCardJoin, TeamCardJoin.card_id == card_type.card_id)
+def generate_shown_powerups(session: Session, chat_id: int, num_cards: int) -> list[PowerupCard]:
+    query = (
+        select(PowerupCard, TeamCardJoin)
+        .join(TeamCardJoin, TeamCardJoin.card_id == PowerupCard.card_id)
         .where(
+            TeamCardJoin.team_chat_id == chat_id,
+            TeamCardJoin.state == CardState.UNDRAWN,
+        )
+    )
+    result = session.execute(
+        query.order_by(func.random()).limit(num_cards)
+    )
+
+    shown_cards: list[PowerupCard] = []
+    for row in result:
+        card, team_card_join = row.tuple()
+        team_card_join.state = CardState.SHOWN
+        shown_cards.append(card)
+
+    if len(shown_cards) < num_cards:
+        raise CheckFailedError("Not enough tasks left to show")
+
+    session.commit()
+
+    return shown_cards
+
+def db_select_card(session: Session, chat: GameChat, card_id: int, clear_shown: bool) -> Card:
+    team_card_join = session.scalars(
+        select(TeamCardJoin)
+        .where(
+            TeamCardJoin.card_id == card_id,
             TeamCardJoin.team_chat_id == chat.chat_id,
             TeamCardJoin.state == CardState.SHOWN,
         )
-    ).all()
+        .options(joinedload(TeamCardJoin.card))
+    ).one_or_none()
+    if team_card_join is None:
+        raise CheckFailedError("No card found with that ID")
+    team_card_join.state = CardState.DRAWN
 
-    selected_card: T | None = None
-    for row in result:
-        card, team_card_join = row.tuple()
-        if card.card_id != card_id:
-            team_card_join.state = CardState.UNDRAWN
-        else:
-            team_card_join.state = CardState.DRAWN
-            selected_card = card
+    # TODO 'will probably be fine' - need to check that the previous team_card_join is not updated
+    if clear_shown:
+        _ = session.execute(
+            update(TeamCardJoin)
+            .where(
+                TeamCardJoin.team_chat_id == chat.chat_id,
+                TeamCardJoin.state == CardState.SHOWN
+            )
+            .values(state=CardState.UNDRAWN)
+        )
 
-    assert selected_card is not None
-    return selected_card
+    session.commit()
 
-def select_card_keyboard_markup[T: (TaskCard, PowerupCard)](
-    session: Session, chat_id: int, card_type: type[T], enum_value: Enum
-) -> InlineKeyboardMarkup:
-    """
-    Returns an inline keyboard for selecting a shown card of the given type for the given chat ID.
-    """
-    shown_tasks = session.execute(
-        select(card_type)
-        .join(TeamCardJoin, card_type.card_id == TeamCardJoin.card_id)
-        .where(
-            TeamCardJoin.state == CardState.SHOWN,
-            TeamCardJoin.team_chat_id == chat_id,
-        ),
-    ).scalars().all()
+    return team_card_join.card
 
-    keyboard = [[InlineKeyboardButton(
-        f"Task {task_index + 1}",
-        callback_data=f"{format_enum_callback(enum_value)}:{task.card_id}",
-    )] for task_index, task in enumerate(shown_tasks)]
+def create_shown_task_selector(session: Session, chat_id: int, enum_value: Enum) -> InlineKeyboardMarkup:
+    shown_tasks = get_tasks(session, chat_id, CardState.SHOWN)
 
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup.from_column(
+        [InlineKeyboardButton(
+            f"Task {task_index + 1}",
+            callback_data=f"{card_callback_generator(enum_value)}:{task.card_id}",
+        ) for task_index, task in enumerate(shown_tasks)]
+    )
+
+def create_shown_powerup_selector(session: Session, chat_id: int, enum_value: Enum) -> InlineKeyboardMarkup:
+    shown_powerups = get_powerups(session, chat_id, CardState.SHOWN)
+
+    return InlineKeyboardMarkup.from_column(
+        [InlineKeyboardButton(
+            f"Task {task_index + 1}",
+            callback_data=f"{card_callback_generator(enum_value)}:{task.card_id}",
+        ) for task_index, task in enumerate(shown_powerups)]
+    )
 
 def add_points(team_chat: GameChat, task: TaskCard):
     if team_chat.score is None:
