@@ -35,6 +35,7 @@ class Card(Base, kw_only=True):
     __tablename__: str = "Card"
 
     card_id: Mapped[int] = mapped_column(primary_key=True, init=False)
+    title: Mapped[str] = mapped_column()
     card_type: Mapped[CardType] = mapped_column(init=False)
     image_path: Mapped[str] = mapped_column()
 
@@ -119,12 +120,14 @@ class GameChat(Base):
         CheckConstraint("score IS NULL OR role IN ('TEAM_1', 'TEAM_2', 'TEAM_3')", name="score_only_for_team_chats"),
     )
 
+
 class B1G1FStates(Enum):
     INACTIVE = auto()  # powerup not used
     NONE_DRAWN = auto()  # powerup used, no cards drawn
     ONE_DRAWN = auto()  # powerup used, one card drawn
     BOTH_DRAWN = auto()  # powerup used, both cards drawn
     ONE_COMPLETED = auto()  # powerup used, one of two cards completed
+
 
 @final
 class Game(Base):
@@ -136,6 +139,9 @@ class Game(Base):
 
     all_or_nothing: Mapped[bool] = mapped_column(default=False)
     B1G1F: Mapped[B1G1FStates] = mapped_column(default=B1G1FStates.INACTIVE)  # REFER TO PPT ^&@!^#&*@!^#&^!@*&#^#&*
+
+    reveal_num_tasks: Mapped[int] = mapped_column(default=3)
+    reveal_more: Mapped[bool] = mapped_column(default=True)
 
     running_team_chat_id: Mapped[int | None] = mapped_column(ForeignKey("Chat.chat_id"), default=None)
 
@@ -181,7 +187,7 @@ class Game(Base):
     )
     running_team_chat: Mapped[GameChat | None] = relationship(
         foreign_keys=[running_team_chat_id],
-        init=False
+        init=False,
     )
 
     __table_args__: tuple[Constraint, ...] = (
@@ -193,7 +199,7 @@ class CardState(StrEnum):
     UNDRAWN = "undrawn"
     SHOWN = "shown"
     DRAWN = "drawn"
-    PENDING = "pending"  # only for buy 1 get 1 free
+    PENDING = "pending"  # only for B1G1F
     USED = "used"
 
 
@@ -206,7 +212,9 @@ class TeamCardJoin(Base):
     card_id: Mapped[int] = mapped_column(ForeignKey("Card.card_id", ondelete="CASCADE"))
     state: Mapped[CardState] = mapped_column()
 
-    team_chat: Mapped[GameChat] = relationship(back_populates="team_card_joins", foreign_keys=[team_chat_id], init=False)
+    team_chat: Mapped[GameChat] = relationship(
+        back_populates="team_card_joins", foreign_keys=[team_chat_id], init=False,
+    )
     card: Mapped[Card] = relationship(back_populates="team_card_joins", foreign_keys=[card_id], init=False)
 
     __table_args__: tuple[Constraint, ...] = (

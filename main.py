@@ -8,7 +8,7 @@ from handlers import set_handlers
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING
+    level=logging.WARNING,
 )
 
 if __name__ == '__main__':
