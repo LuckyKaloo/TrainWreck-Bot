@@ -2,7 +2,7 @@ from sqlalchemy import DDL, create_engine
 
 from mappings import Base
 
-engine = create_engine("sqlite:///games.db")
+engine = create_engine("sqlite:///games.db", echo=True)
 
 with engine.connect() as conn:
     _ = conn.execute(DDL("DROP TABLE IF EXISTS Card"))

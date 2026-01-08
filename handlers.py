@@ -256,10 +256,10 @@ class StartCycleActions(Enum):
 
 async def _start_cycle(session: Session, tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = ensure_admin_chat(session, tele_update)
-    game = to_started_game(chat.game)
-    running_chat_id = game.running_team_chat.chat_id
+    started_game = to_started_game(chat.game)
+    running_chat_id = started_game.running_team_chat.chat_id
     for team_num in range(1, 4):
-        team_chat: GameChat = cast(GameChat, getattr(game, f"team_{team_num}_chat"))
+        team_chat: GameChat = cast(GameChat, getattr(started_game, f"team_{team_num}_chat"))
         if team_chat.chat_id == running_chat_id:
             text = "The game has started! You are the runners, please send your location into the location chat"
         else:
@@ -275,7 +275,7 @@ async def _start_cycle(session: Session, tele_update: Update, context: ContextTy
     callback_message = await context.bot.send_message(
         running_chat_id, "Select your task:", reply_markup=keyboard_markup,
     )
-    game.running_team_chat.callback_message_id = callback_message.message_id
+    started_game.running_team_chat.callback_message_id = callback_message.message_id
 
     session.commit()
 
@@ -449,6 +449,8 @@ async def on_select_task(tele_update: Update, context: ContextTypes.DEFAULT_TYPE
             raise RuntimeError(f"Invalid B1G1F state when drawing tasks: {B1G1F}")
 
         game.all_or_nothing = False
+        game.reveal_num_tasks = None
+        game.reveal_more = None
 
         session.commit()
 
@@ -668,7 +670,7 @@ async def complete_task_handler(tele_update: Update, context: ContextTypes.DEFAU
                 raise RuntimeError("Drawn card is not a task card")
             drawn_tasks.append(team_card_join.card)
 
-        if game.B1G1F == B1G1FStates.INACTIVE:
+        if game.B1G1F == B1G1FStates.INACTIVE or game.B1G1F == B1G1FStates.NONE_DRAWN:
             if len(team_card_joins) != 1:
                 raise RuntimeError("Multiple drawn tasks found despite B1G1F being inactive")
 
@@ -840,7 +842,7 @@ async def on_use_powerup_select(tele_update: Update, context: ContextTypes.DEFAU
     with Session(engine) as session:
         chat, data = await validate_callback_query(session, tele_update, context)
         chat_id = chat.chat_id
-        game = to_started_game(chat.game)
+        started_game = to_started_game(chat.game)
 
         if data.split(":")[-1] == "CANCEL":
             _ = await context.bot.send_message(chat_id, "Powerup use cancelled")
@@ -865,17 +867,19 @@ async def on_use_powerup_select(tele_update: Update, context: ContextTypes.DEFAU
         if not isinstance(selected_powerup, PowerupCard):
             raise RuntimeError("Selected card is not a powerup card")
 
-        for game_chat in [game.team_1_chat, game.team_2_chat, game.team_3_chat]:
-            if game_chat.chat_id != chat_id:
+        for game_chat in [started_game.team_1_chat, started_game.team_2_chat, started_game.team_3_chat]:
+            if game_chat.chat_id != chat_id and selected_powerup.powerup_send_to_chasers:
                 _ = await context.bot.send_message(
                     game_chat.chat_id, "The runners have used the following powerup:",
                 )
                 _ = await context.bot.send_photo(game_chat.chat_id, selected_powerup.image_path)
-            else:
+            elif game_chat.chat_id == chat_id:
                 _ = await context.bot.send_message(chat_id, "You have used the following powerup:")
                 _ = await context.bot.send_photo(chat_id, selected_powerup.image_path)
         team_card_join.state = CardState.USED
+        session.commit()
 
+        game = chat.game
         if selected_powerup.powerup_special == PowerupSpecial.BUY_1_GET_1_FREE:
             game.B1G1F = B1G1FStates.NONE_DRAWN
         elif selected_powerup.powerup_special == PowerupSpecial.ALL_OR_NOTHING:
