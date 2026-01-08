@@ -140,8 +140,8 @@ class Game(Base):
     all_or_nothing: Mapped[bool] = mapped_column(default=False)
     B1G1F: Mapped[B1G1FStates] = mapped_column(default=B1G1FStates.INACTIVE)  # REFER TO PPT ^&@!^#&*@!^#&^!@*&#^#&*
 
-    reveal_num_tasks: Mapped[int] = mapped_column(default=3)
-    reveal_more: Mapped[bool] = mapped_column(default=True)
+    reveal_num_tasks: Mapped[int | None] = mapped_column(default=None)
+    reveal_more: Mapped[bool | None] = mapped_column(default=None)
 
     running_team_chat_id: Mapped[int | None] = mapped_column(ForeignKey("Chat.chat_id"), default=None)
 

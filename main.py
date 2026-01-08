@@ -2,6 +2,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
+from telegram import BotCommand
 from telegram.ext import ApplicationBuilder, AIORateLimiter
 
 from handlers import set_handlers
@@ -28,4 +29,15 @@ if __name__ == '__main__':
 
     set_handlers(application)
 
+    # command_names = [
+    #     "/start", "/help",
+    #     "/create_game", "/create_team_1", "/create_team_2", "/create_team_3", "/create_location_chat",
+    #     "/delete_game", "/delete_team_1", "/delete_team_2", "/delete_team_3", "/delete_location_chat",
+    #     "/start_game", "/end_game", "/catch", ";restart_game",
+    #     "/complete_task",
+    #     "/current_task", "/show_powerups", "/use_powerup",
+    # ]
+    # commands = [BotCommand(name, "") for name in command_names]
+    # await application.bot.set_my_commands(commands)
+    #
     application.run_polling()

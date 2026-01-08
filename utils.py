@@ -17,7 +17,6 @@ from mappings import B1G1FStates, Card, ChatRole, PowerupCard, TaskSpecial, Task
     TeamCardJoin, CardState
 
 # --- Loading cards ---
-# TODO store in json lol
 _POWERUP_DO_NOT_SEND_NAMES = ["All or Nothing", "Buy 1 Get 1 Free"]
 _TASK_NAME_TO_SPECIAL = {
     "Pair O' Legs Error": TaskSpecial.FULLERTON,
@@ -338,7 +337,6 @@ def db_select_card(session: Session, chat: GameChat, card_id: int, clear_shown: 
         raise CheckFailedError("No card found with that ID")
     team_card_join.state = CardState.DRAWN
 
-    # TODO 'will probably be fine' - need to check that the previous team_card_join is not updated
     if clear_shown:
         _ = session.execute(
             update(TeamCardJoin)

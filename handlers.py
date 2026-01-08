@@ -4,8 +4,8 @@ from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from telegram import InlineKeyboardButton, Update, InlineKeyboardMarkup
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, CommandHandler
+from telegram import BotCommand, InlineKeyboardButton, Update, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, CommandHandler, ExtBot, JobQueue
 
 from db import engine
 from mappings import ChatRole, Game, GameChat, Card, CardType, PowerupSpecial, TaskSpecial, TeamCardJoin, CardState, \
@@ -45,14 +45,19 @@ async def help_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "Available commands:\n"
         "/help - Lists all available commands\n"
-        "/create_team <team_number> - Assigns this chat to the chosen team number, only works if team does not already exist\n"
-        "/rules - Displays the game rule cards\n"
-        "/current_task - Shows the current task card for your team\n"
-        "/show_powerups - Displays your team's current powerup cards\n"
-        "/use_powerup - Displays your team's current powerup cards and allows you to choose one to use\n"
-        "/complete_task - Marks the current task as complete and starts a new draw\n\n"
-        "/admin_chat <password> - Sets this chat as the admin chat (requires password)\n"
-        "/location_chat - Sets this chat as the location chat\n"
+        "/rules - Shows the game rules\n"
+        "\n"
+        "/create_game - Creates a new game and assigns this chat as the admin chat\n"
+        "/create_team_1 - Assigns this chat as team 1's chat\n"
+        "/create_team_2 - Assigns this chat as team 2's chat\n"
+        "/create_team_3 - Assigns this chat as team 3's chat\n"
+        "/create_location_chat - Assigns this chat as the location chat\n"
+        "\n"
+        "Runner-only commands:\n"
+        "/current_task - Shows the currently drawn tasks\n"
+        "/show_powerups - Shows the currently drawn powerups\n"
+        "/complete_task - Marks a drawn task as completed and draws new tasks/powerups\n"
+        "/use_powerup - Initiates the use of a powerup\n"
     )
 
     with Session(engine) as session:
@@ -61,14 +66,16 @@ async def help_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chat.game.admin_chat.chat_id == chat.chat_id:
                 help_text += (
                     "\nAdmin commands:\n"
-                    "/delete_team <team_number> - Deletes the specified team chat assignment\n"
-                    "/delete_admin_chat - Deletes the admin chat assignment"
+                    "/delete_game - Deletes the game and unassigns all chats\n"
+                    "/delete_team_1 - Deletes team 1's chat assignment\n"
+                    "/delete_team_2 - Deletes team 2's chat assignment\n"
+                    "/delete_team_3 - Deletes team 3's chat assignment\n"
                     "/delete_location_chat - Deletes the location chat assignment\n"
-                    "/catch - Marks a catch as having occurred in the game and updates teams' roles. Once all teams are ready, restart the game by running /restart_game\n"
+                    "\n"
                     "/start_game - Starts the game for all teams\n"
-                    "/restart_game - Restarts the game for all teams after a catch\n"
-                    "/end_game - Ends the game for all teams, can be undone by calling /start_game\n"
-                    "/reset_game - Resets the game state entirely, cannot be undone\n"
+                    "/end_game - Ends the game for all teams\n"
+                    "/catch - Marks a catch as having occurred in the game and updates teams' roles. Once all teams are ready, restart the game by running /restart_game\n"
+                    "/restart_game - Restarts the game after a catch has occurred\n"
                 )
         except CheckFailedError:
             pass
@@ -512,10 +519,20 @@ async def on_B1G1F_use_or_keep(tele_update: Update, context: ContextTypes.DEFAUL
         session.commit()
 
 
-async def _draw_new_cards(
-    session: Session, chat: GameChat, context: ContextTypes.DEFAULT_TYPE,
-    num_cards: int, extremes_only: bool, reveal_more: bool
-):
+async def _draw_new_cards(session: Session, chat: GameChat, context: ContextTypes.DEFAULT_TYPE):
+    game = chat.game
+    num_cards = game.reveal_num_tasks or 3
+    extremes_only = game.all_or_nothing
+    reveal_more = game.reveal_more if game.reveal_more is not None else True
+
+    if game.B1G1F == B1G1FStates.BOTH_DRAWN:
+        game.B1G1F = B1G1FStates.ONE_COMPLETED
+        session.commit()
+        return
+    elif game.B1G1F == B1G1FStates.ONE_COMPLETED:
+        game.B1G1F = B1G1FStates.INACTIVE
+        session.commit()
+
     chat_id = chat.chat_id
     for task in generate_shown_tasks(session, chat_id, num_cards, extremes_only):
         _ = await context.bot.send_photo(chat_id, task.image_path)
@@ -587,19 +604,20 @@ async def _get_task_info(session: Session, card: TaskCard, chat: GameChat, conte
             reply_markup=keyboard,
         )
         chat.callback_message_id = callback_message.message_id
-    else:
-        if card.task_special == TaskSpecial.NONE:
-            num_cards = 3
-        elif card.task_special == TaskSpecial.MBS:
-            num_cards = random.randint(1, 3)
-            _ = await context.bot.send_message(
-                chat.chat_id,
-                f"The dice has ordained that your next draw will reveal {num_cards} tasks",
-            )
-        else:
-            raise RuntimeError(f"Unknown task special: {card.task_special}")
 
-        await _draw_new_cards(session, chat, context, num_cards, chat.game.all_or_nothing, True)
+        session.commit()
+        return
+    elif card.task_special == TaskSpecial.MBS:
+        game = chat.game
+        num_tasks = random.randint(1, 3)
+        game.reveal_num_tasks = num_tasks
+        _ = await context.bot.send_message(
+            chat.chat_id,
+            f"The dice has ordained that your next draw will reveal {num_tasks} tasks",
+        )
+        session.commit()
+
+    await _draw_new_cards(session, chat, context)
 
 
 @graceful_fail
@@ -613,18 +631,18 @@ async def on_fullerton_response(tele_update: Update, context: ContextTypes.DEFAU
             _ = await context.bot.send_message(
                 chat.chat_id, "Since you arrived early/on time, the draw will proceed normally"
             )
-            reveal_more = True
+            game.reveal_more = True
         elif response == "LATE":
             _ = await context.bot.send_message(
                 chat.chat_id, "Since you arrived late, you will not get to reveal more cards"
             )
-            reveal_more = False
+            game.reveal_more = False
         else:
             raise RuntimeError(f"Invalid Fullerton response: {response}")
 
-        await _draw_new_cards(session, chat, context, 3, game.all_or_nothing, reveal_more)
-
         session.commit()
+
+        await _draw_new_cards(session, chat, context)
 
 
 @graceful_fail
@@ -663,6 +681,8 @@ async def complete_task_handler(tele_update: Update, context: ContextTypes.DEFAU
                 f"Task completed! You now have {chat.score} points.",
             )
 
+            session.commit()
+
             await _get_task_info(session, drawn_task, chat, context)
         elif game.B1G1F == B1G1FStates.BOTH_DRAWN:
             if len(team_card_joins) != 2:
@@ -679,6 +699,8 @@ async def complete_task_handler(tele_update: Update, context: ContextTypes.DEFAU
                 reply_markup=keyboard,
             )
             chat.callback_message_id = callback_message.message_id
+
+            session.commit()
         elif game.B1G1F == B1G1FStates.ONE_COMPLETED:
             if len(team_card_joins) != 1:
                 raise RuntimeError("Expected 2 drawn tasks with B1G1F ONE_COMPLETED state")
@@ -712,6 +734,10 @@ async def complete_task_handler(tele_update: Update, context: ContextTypes.DEFAU
                 f"Both tasks completed! You now have {chat.score} points.",
             )
 
+            session.commit()
+
+            await _get_task_info(session, drawn_task, chat, context)
+
         session.commit()
 
 
@@ -737,10 +763,9 @@ async def on_B1G1F_select_completed_task(tele_update: Update, context: ContextTy
             raise RuntimeError("Selected card is not a task card")
         team_card_join.state = CardState.PENDING
 
-        # TODO: cannot use _get_task_info cos it calls _draw_new_cards, need to add num_tasks and reveal_next to game
-        await _get_task_info(session, selected_task, chat, context)
-
         session.commit()
+
+        await _get_task_info(session, selected_task, chat, context)
 
 
 # --- Mid-cycle handlers ---
@@ -781,7 +806,7 @@ class UsePowerupStates(Enum):
 @graceful_fail
 @no_callback
 async def use_powerup_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with Session(engine) as session:
+    with (Session(engine) as session):
         chat = ensure_running_team_chat(session, tele_update)
         chat_id = chat.chat_id
 
@@ -790,10 +815,21 @@ async def use_powerup_handler(tele_update: Update, context: ContextTypes.DEFAULT
             raise CheckFailedError("No shown powerups found")
         for powerup in drawn_powerups:
             _ = await context.bot.send_photo(chat_id, powerup.image_path)
-        keyboard = create_shown_powerup_selector(session, chat_id, CardState.DRAWN)
+
+        column = [
+            InlineKeyboardButton(
+                powerup.title,
+                callback_data=f"{card_callback_generator(UsePowerupStates.SELECTING_POWERUP)}:{powerup.card_id}",
+            ) for powerup in drawn_powerups
+        ] + [InlineKeyboardButton(
+            "Cancel",
+            callback_data=f"{card_callback_generator(UsePowerupStates.SELECTING_POWERUP)}:CANCEL",
+        )]
+
+        keyboard = InlineKeyboardMarkup.from_column(column)
 
         callback_message = await context.bot.send_message(
-            chat_id, "Select a powerup to draw:", reply_markup=keyboard,
+            chat_id, "Select a powerup to use:", reply_markup=keyboard,
         )
         chat.callback_message_id = callback_message.message_id
         session.commit()
@@ -806,6 +842,12 @@ async def on_use_powerup_select(tele_update: Update, context: ContextTypes.DEFAU
         chat_id = chat.chat_id
         game = to_started_game(chat.game)
 
+        if data.split(":")[-1] == "CANCEL":
+            _ = await context.bot.send_message(chat_id, "Powerup use cancelled")
+            chat.callback_message_id = None
+            session.commit()
+            return
+
         card_id = int(data.split(":")[-1])
         team_card_join = session.scalars(
             select(TeamCardJoin)
@@ -813,7 +855,7 @@ async def on_use_powerup_select(tele_update: Update, context: ContextTypes.DEFAU
             .where(
                 TeamCardJoin.team_chat_id == chat.chat_id,
                 TeamCardJoin.card_id == card_id,
-                TeamCardJoin.state == CardState.SHOWN,
+                TeamCardJoin.state == CardState.DRAWN,
             ),
         ).one_or_none()
 
@@ -843,11 +885,12 @@ async def on_use_powerup_select(tele_update: Update, context: ContextTypes.DEFAU
 
 
 # --- Setting handlers ---
-def set_handlers(application: Application[Any, Any, Any, Any, Any, Any]) -> None:  # pyright: ignore [reportExplicitAny]
+type ApplicationType = Application[ExtBot[int], ContextTypes.DEFAULT_TYPE, dict[Any, Any], dict[Any, Any], dict[Any, Any], JobQueue[ContextTypes.DEFAULT_TYPE]]  # pyright: ignore[reportExplicitAny]
+def set_handlers(application: ApplicationType) -> None:
     handlers = [
         CommandHandler("start", start_handler),
         CommandHandler("help", help_handler),
-        CommandHandler("cancel", cancel_handler),
+        # CommandHandler("cancel", cancel_handler),
 
         CommandHandler("create_game", create_game_handler),
         CommandHandler("create_team_1", create_team_handler_generator(1)),
