@@ -11,7 +11,7 @@ from db import engine
 from mappings import ChatRole, Game, GameChat, Card, CardType, PowerupSpecial, TaskSpecial, TeamCardJoin, CardState, \
     B1G1FStates, \
     PowerupCard, TaskCard
-from utils import CheckFailedError, add_points, card_callback_generator, card_callback_pattern, \
+from utils import CheckFailedError, add_points, card_callback_generator, card_callback_pattern, chat_not_assigned_check, \
     create_shown_task_selector, \
     get_game_chat_or_raise, \
     get_chat_id, get_tasks, validate_callback_query, validate_game_id, \
@@ -110,6 +110,8 @@ async def cancel_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE
 @no_callback
 async def create_game_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     with Session(engine) as session:
+        chat_not_assigned_check(session, tele_update)
+
         while True:
             game_id = random.randint(100000, 999999)
             if session.get(Game, game_id) is None:
@@ -135,6 +137,8 @@ def create_team_handler_generator(team_num: Literal[1, 2, 3]):
     @no_callback
     async def create_team_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
         with Session(engine) as session:
+            chat_not_assigned_check(session, tele_update)
+
             game = validate_game_id(session, context)
             if getattr(game, f"team_{team_num}_chat") is not None:
                 raise CheckFailedError(
@@ -168,6 +172,8 @@ def create_team_handler_generator(team_num: Literal[1, 2, 3]):
 @no_callback
 async def create_location_chat_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     with Session(engine) as session:
+        chat_not_assigned_check(session, tele_update)
+
         game = validate_game_id(session, context)
         if game.location_chat is not None:
             raise CheckFailedError(
