@@ -13,8 +13,7 @@ logging.basicConfig(
 )
 
 if __name__ == '__main__':
-    if not load_dotenv():
-        raise RuntimeError('No .env found.')
+    _ = load_dotenv()
 
     bot_token = os.getenv("BOT_TOKEN")
     if bot_token is None:
