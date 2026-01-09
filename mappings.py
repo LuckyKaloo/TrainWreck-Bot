@@ -95,7 +95,7 @@ class GameChat(Base):
     __tablename__ = "Chat"
 
     chat_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
-    game_id: Mapped[int] = mapped_column(ForeignKey("Game.game_id"))
+    game_id: Mapped[int] = mapped_column(ForeignKey("Game.game_id", ondelete="CASCADE"))
     role: Mapped[ChatRole] = mapped_column()
     callback_message_id: Mapped[int | None] = mapped_column(default=None)
 
@@ -152,6 +152,7 @@ class Game(Base):
         single_parent=True,
         overlaps="location_chat,team_1_chat,team_2_chat,team_3_chat",
         init=False,
+        post_update=True,
     )
     location_chat: Mapped[GameChat | None] = relationship(
         foreign_keys=[game_id],
@@ -160,6 +161,7 @@ class Game(Base):
         single_parent=True,
         overlaps="admin_chat,team_1_chat,team_2_chat,team_3_chat",
         init=False,
+        post_update=True,
     )
     team_1_chat: Mapped[GameChat | None] = relationship(
         foreign_keys=[game_id],
@@ -168,6 +170,7 @@ class Game(Base):
         single_parent=True,
         overlaps="admin_chat,location_chat,team_2_chat,team_3_chat",
         init=False,
+        post_update=True,
     )
     team_2_chat: Mapped[GameChat | None] = relationship(
         foreign_keys=[game_id],
@@ -176,6 +179,7 @@ class Game(Base):
         single_parent=True,
         overlaps="admin_chat,location_chat,team_1_chat,team_3_chat",
         init=False,
+        post_update=True,
     )
     team_3_chat: Mapped[GameChat | None] = relationship(
         foreign_keys=[game_id],
@@ -184,10 +188,12 @@ class Game(Base):
         single_parent=True,
         overlaps="admin_chat,location_chat,team_1_chat,team_2_chat",
         init=False,
+        post_update=True,
     )
     running_team_chat: Mapped[GameChat | None] = relationship(
         foreign_keys=[running_team_chat_id],
         init=False,
+        post_update=True,
     )
 
     __table_args__: tuple[Constraint, ...] = (

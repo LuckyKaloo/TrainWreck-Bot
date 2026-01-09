@@ -8,7 +8,7 @@ from mappings import Base
 
 _ = load_dotenv()
 
-data_dir = Path(os.getenv("DATA_DIR", "/data"))
+data_dir = Path(os.getenv("DATA_DIR", "data"))
 data_dir.mkdir(parents=True, exist_ok=True)
 
 db_path = data_dir / "games.db"
