@@ -4,7 +4,7 @@ from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from telegram import BotCommand, InlineKeyboardButton, Update, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, Update, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, CommandHandler, ExtBot, JobQueue
 
 from db import engine
@@ -12,7 +12,7 @@ from mappings import ChatRole, Game, GameChat, Card, CardType, PowerupSpecial, T
     B1G1FStates, \
     PowerupCard, TaskCard
 from utils import CheckFailedError, add_points, card_callback_generator, card_callback_pattern, chat_not_assigned_check, \
-    create_shown_task_selector, \
+    create_shown_task_selector, game_not_started_check, \
     get_game_chat_or_raise, \
     get_chat_id, get_tasks, validate_callback_query, validate_game_id, \
     ensure_running_team_chat, \
@@ -47,10 +47,10 @@ async def help_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/rules - Shows the game rules\n"
         "\n"
         "/create_game - Creates a new game and assigns this chat as the admin chat\n"
-        "/create_team_1 - Assigns this chat as team 1's chat\n"
-        "/create_team_2 - Assigns this chat as team 2's chat\n"
-        "/create_team_3 - Assigns this chat as team 3's chat\n"
-        "/create_location_chat - Assigns this chat as the location chat\n"
+        "/create_team_1 <game id> - Assigns this chat as team 1's chat\n"
+        "/create_team_2 <game id> - Assigns this chat as team 2's chat\n"
+        "/create_team_3 <game id> - Assigns this chat as team 3's chat\n"
+        "/create_location_chat <game id> - Assigns this chat as the location chat\n"
         "\n"
         "Runner-only commands:\n"
         "/current_task - Shows the currently drawn tasks\n"
@@ -196,8 +196,15 @@ async def create_location_chat_handler(tele_update: Update, context: ContextType
 @no_callback
 async def delete_game_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     with Session(engine) as session:
+        game_not_started_check(session, tele_update)
+
         chat = ensure_admin_chat(session, tele_update)
         game = chat.game
+        chats = session.scalars(
+            select(GameChat)
+            .where(GameChat.game_id == game.game_id),
+        ).all()
+
         session.delete(game)
         session.commit()
 
@@ -212,6 +219,8 @@ def delete_team_handler_generator(team_num: Literal[1, 2, 3]):
     @no_callback
     async def delete_team_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
         with Session(engine) as session:
+            game_not_started_check(session, tele_update)
+
             chat = ensure_admin_chat(session, tele_update)
             game = chat.game
             team_chat: GameChat | None = cast(GameChat | None, getattr(game, f"team_{team_num}_chat"))
@@ -235,6 +244,8 @@ def delete_team_handler_generator(team_num: Literal[1, 2, 3]):
 @no_callback
 async def delete_location_chat_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     with Session(engine) as session:
+        game_not_started_check(session, tele_update)
+
         chat = ensure_admin_chat(session, tele_update)
         game = chat.game
         location_chat: GameChat | None = game.location_chat
@@ -289,10 +300,10 @@ async def _start_cycle(session: Session, tele_update: Update, context: ContextTy
 @no_callback
 async def start_game_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     with Session(engine) as session:
+        game_not_started_check(session, tele_update)
+
         chat = ensure_admin_chat(session, tele_update)
         game = chat.game
-        if game.is_started:
-            raise CheckFailedError("Game is already started")
 
         missing_chats: list[str] = []
         if game.location_chat is None:
@@ -903,10 +914,10 @@ def set_handlers(application: ApplicationType) -> None:
         # CommandHandler("cancel", cancel_handler),
 
         CommandHandler("create_game", create_game_handler),
-        CommandHandler("create_team_1", create_team_handler_generator(1)),
-        CommandHandler("create_team_2", create_team_handler_generator(2)),
-        CommandHandler("create_team_3", create_team_handler_generator(3)),
-        CommandHandler("create_location_chat", create_location_chat_handler),
+        CommandHandler("create_team_1", create_team_handler_generator(1), has_args=True),
+        CommandHandler("create_team_2", create_team_handler_generator(2), has_args=True),
+        CommandHandler("create_team_3", create_team_handler_generator(3), has_args=True),
+        CommandHandler("create_location_chat", create_location_chat_handler, has_args=True),
 
         CommandHandler("delete_game", delete_game_handler),
         CommandHandler("delete_team_1", delete_team_handler_generator(1)),

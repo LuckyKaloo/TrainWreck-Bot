@@ -149,6 +149,12 @@ def chat_not_assigned_check(session: Session, tele_update: Update) -> None:
         raise CheckFailedError("Chat is already assigned to a role")
 
 
+def game_not_started_check(session: Session, tele_update: Update) -> None:
+    chat: GameChat | None = session.get(GameChat, get_chat_id(tele_update))
+    if chat is not None and chat.game.is_started:
+        raise CheckFailedError("Game is already started")
+
+
 def get_game_chat_or_raise(session: Session, tele_update: Update) -> GameChat:
     chat: GameChat | None = session.get(GameChat, get_chat_id(tele_update))
     if chat is None:
