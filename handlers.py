@@ -31,7 +31,7 @@ async def start_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def rules_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     with Session(engine) as session:
         rule_cards = session.scalars(
-            select(Card).where(Card.card_type == CardType.RULE),
+            select(Card).where(Card.card_type == CardType.RULE).order_by(Card.card_id),
         ).all()
 
         for rule_card in rule_cards:
@@ -40,7 +40,6 @@ async def rules_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
 
 
-# TODO
 async def help_handler(tele_update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "Available commands:\n"
@@ -894,6 +893,7 @@ def set_handlers(application: ApplicationType) -> None:
     handlers = [
         CommandHandler("start", start_handler),
         CommandHandler("help", help_handler),
+        CommandHandler("rules", rules_handler),
         # CommandHandler("cancel", cancel_handler),
 
         CommandHandler("create_game", create_game_handler),

@@ -381,4 +381,7 @@ def add_points(team_chat: GameChat, task: TaskCard):
     if task.task_type == TaskType.NORMAL:
         team_chat.score += 2
     elif task.task_type == TaskType.EXTREME:
-        team_chat.score += 3
+        if team_chat.game.all_or_nothing:
+            team_chat.score += 4
+        else:
+            team_chat.score += 3
