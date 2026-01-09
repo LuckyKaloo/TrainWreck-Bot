@@ -1,8 +1,18 @@
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from sqlalchemy import DDL, create_engine
 
 from mappings import Base
 
-engine = create_engine("sqlite:///games.db", echo=True)
+_ = load_dotenv()
+
+data_dir = Path(os.getenv("DATA_DIR", "/data"))
+data_dir.mkdir(parents=True, exist_ok=True)
+
+db_path = data_dir / "games.db"
+engine = create_engine(f"sqlite:///{db_path}", echo=True)
 
 with engine.connect() as conn:
     _ = conn.execute(DDL("DROP TABLE IF EXISTS Card"))
